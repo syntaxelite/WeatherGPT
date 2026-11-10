@@ -74,9 +74,29 @@ interface WeatherResponse {
   };
 }
 
+interface ConversationTurn {
+  question: string;
+  answer: string;
+}
+
+interface SelectedWeatherLocation {
+  name: string;
+  region: string;
+  country: string;
+  latitude?: number;
+  longitude?: number;
+}
+
 type ViewState = "initial" | "loading" | "success" | "error";
 type SearchMode = "city" | "question" | "compare";
-type RequestBody = { city: string } | { question: string } | { latitude: number; longitude: number };
+type RequestBody =
+  | { city: string }
+  | {
+      question: string;
+      conversation?: ConversationTurn[];
+      default_location?: SelectedWeatherLocation;
+    }
+  | { latitude: number; longitude: number };
 interface ComparisonResponse {
   comparisons: WeatherResponse[];
 }
@@ -122,6 +142,18 @@ function isWeatherResponse(value: unknown): value is WeatherResponse {
     typeof response.weather?.timezone === "string" &&
     Array.isArray(response.weather?.forecast) &&
     Array.isArray(response.weather?.hourly)
+  );
+}
+
+function isConversationalResponse(value: unknown): value is { type: "conversation"; answer: string } {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "type" in value &&
+    value.type === "conversation" &&
+    "answer" in value &&
+    typeof value.answer === "string" &&
+    value.answer.trim().length > 0
   );
 }
 
@@ -174,6 +206,8 @@ export default function App() {
   const locationRequestStarted = useRef(false);
   const retryRequest = useRef<{ body: RequestBody; query: string } | null>(null);
   const retryComparisonRequest = useRef<[string, string] | null>(null);
+  const conversationHistory = useRef<ConversationTurn[]>([]);
+  const selectedWeatherLocation = useRef<SelectedWeatherLocation | null>(null);
   const [query, setQuery] = useState("");
   const [searchMode, setSearchMode] = useState<SearchMode>("city");
   const [comparisonCities, setComparisonCities] = useState<[string, string]>(["", ""]);
@@ -183,6 +217,7 @@ export default function App() {
   const [currentCityQuery, setCurrentCityQuery] = useState("");
   const [viewState, setViewState] = useState<ViewState>("initial");
   const [result, setResult] = useState<WeatherResponse | null>(null);
+  const [conversationAnswer, setConversationAnswer] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
   const [locationMessage, setLocationMessage] = useState(
     "Allow location access when your browser asks. You can search for a city instead.",
@@ -227,6 +262,7 @@ export default function App() {
   async function loadWeather(body: RequestBody, submitted: string) {
     setViewState("loading");
     setErrorMessage("");
+    setConversationAnswer("");
     setComparison(null);
     retryComparisonRequest.current = null;
     retryRequest.current = { body, query: submitted };
@@ -251,13 +287,45 @@ export default function App() {
             : "Weather data is temporarily unavailable. Please try again.";
         throw new Error(message);
       }
+      if (isConversationalResponse(payload)) {
+        setResult(null);
+        setConversationAnswer(payload.answer);
+        setSubmittedQuery(submitted);
+        setCurrentCityQuery("");
+        if ("question" in body) {
+          conversationHistory.current = [
+            ...conversationHistory.current,
+            { question: body.question, answer: payload.answer },
+          ].slice(-6);
+        }
+        setViewState("success");
+        return true;
+      }
       if (!isWeatherResponse(payload)) {
         throw new Error("The forecast came back incomplete. Please try again.");
       }
 
       setResult(payload);
+      setConversationAnswer("");
       setSubmittedQuery(submitted);
       setCurrentCityQuery("city" in body ? body.city : "");
+      selectedWeatherLocation.current = {
+        name: payload.location.name,
+        region: payload.location.region,
+        country: payload.location.country,
+        ...(payload.location.latitude !== undefined && payload.location.longitude !== undefined
+          ? {
+              latitude: payload.location.latitude,
+              longitude: payload.location.longitude,
+            }
+          : {}),
+      };
+      if ("question" in body) {
+        conversationHistory.current = [
+          ...conversationHistory.current,
+          { question: body.question, answer: payload.answer },
+        ].slice(-6);
+      }
       setViewState("success");
       return true;
     } catch (error) {
@@ -292,6 +360,7 @@ export default function App() {
     setErrorMessage("");
     setComparison(null);
     setResult(null);
+    setConversationAnswer("");
     retryRequest.current = null;
     retryComparisonRequest.current = cities;
 
@@ -364,7 +433,13 @@ export default function App() {
     const body: RequestBody =
       searchMode === "city"
         ? { city: trimmedQuery }
-        : { question: trimmedQuery };
+        : {
+            question: trimmedQuery,
+            conversation: conversationHistory.current.slice(-6),
+            ...(selectedWeatherLocation.current
+              ? { default_location: selectedWeatherLocation.current }
+              : {}),
+          };
     setLocationFallback(false);
     setLocationMessage("");
     await loadWeather(body, trimmedQuery);
@@ -565,6 +640,7 @@ export default function App() {
         <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
           {viewState === "loading" && "Checking the latest weather and forecast."}
           {viewState === "success" && result && `Weather for ${result.location.name} is ready.`}
+          {viewState === "success" && conversationAnswer && "WeatherGPT's answer is ready."}
           {viewState === "error" && errorMessage}
         </div>
 
@@ -574,6 +650,18 @@ export default function App() {
         )}
         {viewState === "success" && comparison && (
           <CityComparison comparison={comparison} />
+        )}
+
+        {viewState === "success" && conversationAnswer && (
+          <section className="weather-result" aria-label="WeatherGPT answer">
+            <div className="answer-panel">
+              <div>
+                <p className="result-label">WEATHERGPT ANSWERS</p>
+                <p className="asked-question">{submittedQuery}</p>
+              </div>
+              <p className="answer-text">{conversationAnswer}</p>
+            </div>
+          </section>
         )}
 
         {viewState === "success" && result && !comparison && (

@@ -2,7 +2,7 @@
 
 WeatherGPT is a React, Vite, and TypeScript frontend backed by Flask. It uses Open-Meteo for geocoding and live weather forecasts, and Groq with Qwen for weather-question interpretation. The backend builds answers from retrieved forecast facts; the model does not invent or generate weather conditions. API keys stay on the backend.
 
-Features include current conditions, seven-day forecasts, transparent walk advice, hourly activity planning, two-city comparison, saved cities in browser storage, hourly and daily weather visualizations, and concise weather answers for practical questions such as picnics, travel, running, and umbrella recommendations. Time-specific answers use the location's hourly forecast and state when the requested data is unavailable.
+Features include current conditions, seven-day forecasts, transparent walk advice, hourly activity planning, two-city comparison, saved cities in browser storage, hourly and daily weather visualizations, conversational weather-science answers, and concise weather recommendations for picnics, travel, running, and umbrellas. Follow-up questions use recent in-session context; live-weather answers remain grounded in Open-Meteo forecasts and report when requested data is unavailable.
 
 ## Requirements
 

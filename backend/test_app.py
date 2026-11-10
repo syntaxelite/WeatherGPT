@@ -197,7 +197,8 @@ class WeatherEndpointTests(unittest.TestCase):
         response = groq_client.return_value.chat.completions.create.return_value
         response.choices = [Mock(message=Mock(content=(
             '{"is_weather_question": true, "location": "Munnar", '
-            '"day_offset": 0, "activity": "picnic", "local_time": "15:00"}'
+            '"day_offset": 0, "activity": "picnic", "local_time": "15:00", '
+            '"requires_live_weather": true}'
         )))]
 
         self.assertEqual(
@@ -207,8 +208,350 @@ class WeatherEndpointTests(unittest.TestCase):
                 "day_offset": 0,
                 "activity": "picnic",
                 "local_time": "15:00",
+                "requires_live_weather": True,
             },
         )
+
+    @patch.object(app, "_groq_client")
+    def test_understands_general_weather_science_without_a_location(self, groq_client):
+        response = groq_client.return_value.chat.completions.create.return_value
+        response.choices = [Mock(message=Mock(content=(
+            '{"is_weather_question": true, "location": "", "day_offset": 0, '
+            '"activity": "general", "local_time": "", '
+            '"requires_live_weather": false}'
+        )))]
+
+        self.assertEqual(
+            app.understand_question("Why does humidity make us feel hotter?"),
+            {
+                "location": "",
+                "day_offset": 0,
+                "activity": "general",
+                "local_time": None,
+                "requires_live_weather": False,
+            },
+        )
+
+    @patch.object(app, "_groq_client")
+    def test_understands_location_from_follow_up_context(self, groq_client):
+        response = groq_client.return_value.chat.completions.create.return_value
+        response.choices = [Mock(message=Mock(content=(
+            '{"is_weather_question": true, "location": "Munnar", '
+            '"day_offset": 1, "activity": "picnic", "local_time": "15:00", '
+            '"requires_live_weather": true}'
+        )))]
+        conversation = [
+            {
+                "question": "Can I picnic in Munnar today?",
+                "answer": "It depends on the forecast.",
+            }
+        ]
+
+        intent = app.understand_question("What about tomorrow at 3?", conversation)
+
+        self.assertEqual(intent["location"], "Munnar")
+        self.assertEqual(intent["day_offset"], 1)
+        prompt = groq_client.return_value.chat.completions.create.call_args.kwargs[
+            "messages"
+        ][1]["content"]
+        self.assertIn("Can I picnic in Munnar today?", prompt)
+        self.assertIn("It depends on the forecast.", prompt)
+
+    @patch.object(app, "_groq_client")
+    def test_conceptual_answer_uses_conversation_for_follow_up(self, groq_client):
+        response = groq_client.return_value.chat.completions.create.return_value
+        response.choices = [
+            Mock(message=Mock(content="It slows down sweat evaporation."))
+        ]
+        conversation = [
+            {
+                "question": "Why does humidity make us feel hotter?",
+                "answer": "Humid air slows sweat evaporation.",
+            }
+        ]
+
+        answer = app.answer_conceptual_question(
+            "Can you explain that more simply?",
+            conversation,
+        )
+
+        self.assertEqual(answer, "It slows down sweat evaporation.")
+        messages = groq_client.return_value.chat.completions.create.call_args.kwargs[
+            "messages"
+        ]
+        self.assertEqual(
+            [(message["role"], message["content"]) for message in messages[1:]],
+            [
+                ("user", "Why does humidity make us feel hotter?"),
+                ("assistant", "Humid air slows sweat evaporation."),
+                ("user", "Can you explain that more simply?"),
+            ],
+        )
+
+    @patch.object(app, "_groq_client")
+    def test_live_weather_question_still_requires_a_location(self, groq_client):
+        response = groq_client.return_value.chat.completions.create.return_value
+        response.choices = [Mock(message=Mock(content=(
+            '{"is_weather_question": true, "location": "", "day_offset": 0, '
+            '"activity": "general", "local_time": "", '
+            '"requires_live_weather": true}'
+        )))]
+
+        intent = app.understand_question("Will it rain this afternoon?")
+        self.assertTrue(intent["requires_live_weather"])
+        self.assertEqual(intent["location"], "")
+
+    @patch.object(app, "understand_question")
+    @patch.object(app, "resolve_location")
+    @patch.object(app, "get_forecast", return_value=weather_fixture())
+    def test_live_question_uses_selected_default_location_for_umbrella_advice(
+        self,
+        forecast,
+        resolve,
+        understand,
+    ):
+        understand.return_value = {
+            "location": "",
+            "day_offset": 0,
+            "activity": "umbrella",
+            "local_time": None,
+            "requires_live_weather": True,
+        }
+        resolve.return_value = {
+            "name": "Munnar",
+            "region": "Kerala",
+            "country": "India",
+            "latitude": 10.09,
+            "longitude": 77.06,
+        }
+
+        response = self.client.post(
+            "/api/weather",
+            json={
+                "question": "Should I carry an umbrella?",
+                "default_location": {
+                    "name": "Munnar",
+                    "region": "Kerala",
+                    "country": "India",
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["answer"].startswith("No,"))
+        self.assertIn("20% chance of rain", payload["answer"])
+        self.assertEqual(payload["location"]["name"], "Munnar")
+        understand.assert_called_once_with("Should I carry an umbrella?", [])
+        resolve.assert_called_once_with("Munnar")
+        forecast.assert_called_once_with(resolve.return_value)
+
+    @patch.object(app, "understand_question")
+    @patch.object(app, "resolve_location")
+    @patch.object(app, "get_forecast", return_value=weather_fixture())
+    def test_explicit_city_takes_priority_over_selected_default_location(
+        self,
+        forecast,
+        resolve,
+        understand,
+    ):
+        understand.return_value = {
+            "location": "Oslo",
+            "day_offset": 0,
+            "activity": "umbrella",
+            "local_time": None,
+            "requires_live_weather": True,
+        }
+        resolve.return_value = {
+            "name": "Oslo",
+            "region": "Oslo",
+            "country": "Norway",
+            "latitude": 59.91,
+            "longitude": 10.75,
+        }
+
+        response = self.client.post(
+            "/api/weather",
+            json={
+                "question": "Should I carry an umbrella in Oslo?",
+                "default_location": {"name": "Munnar"},
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["location"]["name"], "Oslo")
+        self.assertIn("in Oslo", response.get_json()["answer"])
+        resolve.assert_called_once_with("Oslo")
+        forecast.assert_called_once_with(resolve.return_value)
+
+    @patch.object(app, "understand_question")
+    @patch.object(app, "resolve_location")
+    @patch.object(app, "get_forecast")
+    def test_live_question_without_explicit_or_selected_location_asks_for_city(
+        self,
+        forecast,
+        resolve,
+        understand,
+    ):
+        understand.return_value = {
+            "location": "",
+            "day_offset": 0,
+            "activity": "umbrella",
+            "local_time": None,
+            "requires_live_weather": True,
+        }
+
+        response = self.client.post(
+            "/api/weather",
+            json={"question": "Should I carry an umbrella?"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("city or town", response.get_json()["error"])
+        resolve.assert_not_called()
+        forecast.assert_not_called()
+
+    @patch.object(app, "resolve_coordinates", wraps=app.resolve_coordinates)
+    @patch.object(app, "understand_question")
+    @patch.object(app, "get_forecast", return_value=weather_fixture())
+    def test_live_question_reuses_selected_coordinate_location(
+        self,
+        forecast,
+        understand,
+        resolve_coordinates,
+    ):
+        understand.return_value = {
+            "location": "",
+            "day_offset": 0,
+            "activity": "umbrella",
+            "local_time": None,
+            "requires_live_weather": True,
+        }
+
+        response = self.client.post(
+            "/api/weather",
+            json={
+                "question": "Should I carry an umbrella?",
+                "default_location": {
+                    "name": "Your location",
+                    "region": "",
+                    "country": "Browser location",
+                    "latitude": 12.5,
+                    "longitude": -45.25,
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["location"]["name"], "Your location")
+        resolve_coordinates.assert_called_once_with(12.5, -45.25)
+
+    @patch.object(app, "answer_conceptual_question", return_value="Humidity slows sweat evaporation.")
+    @patch.object(app, "understand_question")
+    @patch.object(app, "get_forecast")
+    @patch.object(app, "resolve_location")
+    def test_general_question_is_answered_without_live_weather_or_location(
+        self,
+        resolve,
+        forecast,
+        understand,
+        answer,
+    ):
+        understand.return_value = {
+            "location": "",
+            "day_offset": 0,
+            "activity": "general",
+            "local_time": None,
+            "requires_live_weather": False,
+        }
+
+        response = self.client.post(
+            "/api/weather",
+            json={"question": "Why does humidity make us feel hotter?"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json(),
+            {
+                "type": "conversation",
+                "answer": "Humidity slows sweat evaporation.",
+            },
+        )
+        understand.assert_called_once_with(
+            "Why does humidity make us feel hotter?",
+            [],
+        )
+        answer.assert_called_once_with(
+            "Why does humidity make us feel hotter?",
+            [],
+        )
+        resolve.assert_not_called()
+        forecast.assert_not_called()
+
+    @patch.object(app, "answer_conceptual_question", return_value="It reduces evaporation.")
+    @patch.object(app, "understand_question")
+    @patch.object(app, "get_forecast")
+    @patch.object(app, "resolve_location")
+    def test_follow_up_question_receives_bounded_conversation_context(
+        self,
+        resolve,
+        forecast,
+        understand,
+        answer,
+    ):
+        understand.return_value = {
+            "location": "",
+            "day_offset": 0,
+            "activity": "general",
+            "local_time": None,
+            "requires_live_weather": False,
+        }
+        conversation = [
+            {
+                "question": "Why does humidity make us feel hotter?",
+                "answer": "Humid air slows sweat evaporation.",
+            }
+        ]
+
+        response = self.client.post(
+            "/api/weather",
+            json={
+                "question": "Can you explain that more simply?",
+                "conversation": conversation,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        understand.assert_called_once_with(
+            "Can you explain that more simply?",
+            conversation,
+        )
+        answer.assert_called_once_with(
+            "Can you explain that more simply?",
+            conversation,
+        )
+        resolve.assert_not_called()
+        forecast.assert_not_called()
+
+    def test_rejects_malformed_or_oversized_conversation_context(self):
+        for conversation in (
+            "previous question",
+            [{"question": "Question", "answer": "Answer"}]
+            * (app.MAX_CONVERSATION_TURNS + 1),
+            [{"question": "", "answer": "Answer"}],
+            [{"question": "Question", "answer": "x" * (app.MAX_CONVERSATION_ANSWER_LENGTH + 1)}],
+        ):
+            with self.subTest(conversation=type(conversation).__name__):
+                response = self.client.post(
+                    "/api/weather",
+                    json={
+                        "question": "Why does humidity make us feel hotter?",
+                        "conversation": conversation,
+                    },
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("error", response.get_json())
 
     @patch.object(app, "_groq_client")
     def test_answer_uses_only_retrieved_facts(self, groq_client):
@@ -464,6 +807,7 @@ class WeatherEndpointTests(unittest.TestCase):
             "day_offset": 1,
             "activity": "picnic",
             "local_time": "15:00",
+            "requires_live_weather": True,
         },
     )
     def test_returns_real_weather_payload_shape(
@@ -531,7 +875,10 @@ class WeatherEndpointTests(unittest.TestCase):
 
         answer.assert_called_once()
         self.assertEqual(answer.call_args.args[4:], ("picnic", "15:00"))
-        understand.assert_called_once()
+        understand.assert_called_once_with(
+            "Weather in Arbitrary town tomorrow",
+            [],
+        )
         self.assertEqual(payload["location"]["timezone"], "Europe/Helsinki")
 
     @patch.object(

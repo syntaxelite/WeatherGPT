@@ -32,6 +32,8 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
 
 MAX_QUESTION_LENGTH = 500
 MAX_CITY_LENGTH = 200
+MAX_CONVERSATION_TURNS = 6
+MAX_CONVERSATION_ANSWER_LENGTH = 2000
 
 GROQ_BUSY_MESSAGE = (
     "The AI service is temporarily busy. Please try again in a moment."
@@ -98,7 +100,10 @@ def _raise_groq_error(exc: Exception, fallback_message: str) -> None:
     raise AIServiceError(fallback_message) from exc
 
 
-def understand_question(question: str) -> dict[str, Any]:
+def understand_question(
+    question: str,
+    conversation: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
     """
     Use Qwen through Groq to understand the user's weather question.
 
@@ -107,7 +112,8 @@ def understand_question(question: str) -> dict[str, Any]:
             "location": "...",
             "day_offset": 0,
             "activity": "picnic",
-            "local_time": "15:00"
+            "local_time": "15:00",
+            "requires_live_weather": True
         }
     """
 
@@ -115,17 +121,25 @@ def understand_question(question: str) -> dict[str, Any]:
 
     prompt = (
         "Understand the user's weather request and return JSON only. "
-        "The JSON must contain exactly these fields: "
-        '{"is_weather_question": boolean, "location": string, "day_offset": integer, '
-        '"activity": string, "local_time": string}. '
+        "Return an object with exactly these fields: "
+        '{"is_weather_question": boolean, "requires_live_weather": boolean, '
+        '"location": string, "day_offset": integer, "activity": string, '
+        '"local_time": string}. '
 
-        "Extract only a place explicitly named by the user. "
-        "Do not guess or add a country or region. "
+        "is_weather_question is true for questions about weather, climate, "
+        "or weather science, including conceptual questions that need no location. "
+        "Set requires_live_weather to true only when answering requires actual "
+        "current conditions or a forecast, including activity, travel, or umbrella "
+        "advice based on actual weather; set it false for conceptual explanations. "
+        "For live-weather questions, extract a place explicitly named in the current "
+        "question or clearly established in the recent conversation. Do not invent "
+        "a place or infer one from unrelated context. "
 
         "If the user uses a well-known alternate or historic spelling "
         "for the same place, use its canonical name supported by geocoding. "
 
-        "Set location to an empty string if no place is named. "
+        "Set location to an empty string for conceptual questions or when no "
+        "relevant location is established. "
 
         "day_offset is 0 for today, 1 for tomorrow, and otherwise the "
         "requested day number from today's date "
@@ -143,7 +157,10 @@ def understand_question(question: str) -> dict[str, Any]:
         "Set local_time to the requested local clock time in 24-hour HH:MM "
         "format, or an empty string if no time is specified. Do not infer a time. "
 
-        f"The user's question is: {json.dumps(question, ensure_ascii=False)}"
+        "Use the recent conversation only to understand follow-up references, "
+        "not as a source of current weather data. "
+        f"Recent conversation: {json.dumps(conversation or [], ensure_ascii=False)}. "
+        f"The user's current question is: {json.dumps(question, ensure_ascii=False)}"
     )
 
     try:
@@ -196,14 +213,17 @@ def understand_question(question: str) -> dict[str, Any]:
             "Ask me about the weather in a place."
         )
 
+    requires_live_weather = parsed.get("requires_live_weather")
+    if not isinstance(requires_live_weather, bool):
+        raise AIServiceError(
+            "I couldn't determine whether that question needs a live forecast."
+        )
+
     location = parsed.get("location")
     day_offset = parsed.get("day_offset")
 
-    if not isinstance(location, str) or len(location.strip()) < 2:
-        raise ValueError(
-            "Include a city or town so I know where to check."
-        )
-
+    if not isinstance(location, str):
+        raise AIServiceError("I couldn't identify the requested location.")
     if type(day_offset) is not int or not 0 <= day_offset <= 6:
         raise ValueError(
             "I can check conditions for today and the next six days."
@@ -228,7 +248,125 @@ def understand_question(question: str) -> dict[str, Any]:
         "day_offset": day_offset,
         "activity": activity,
         "local_time": local_time or None,
+        "requires_live_weather": requires_live_weather,
     }
+
+
+def answer_conceptual_question(
+    question: str,
+    conversation: list[dict[str, str]] | None = None,
+) -> str:
+    """Answer a non-live weather or weather-science question through Groq."""
+
+    client = _groq_client()
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are WeatherGPT, a friendly assistant for weather and weather "
+                "science questions. Answer the user's conceptual question directly "
+                "in clear, conversational language, usually in two or three sentences. "
+                "Use the recent conversation to resolve natural follow-ups. "
+                "Do not claim or invent current conditions, forecasts, or other live "
+                "weather data. If a question needs a live forecast, ask for a location "
+                "instead of guessing. If the question is unrelated to weather, kindly "
+                "ask for a weather or weather-science question."
+            ),
+        }
+    ]
+    for turn in conversation or []:
+        messages.extend(
+            [
+                {"role": "user", "content": turn["question"]},
+                {"role": "assistant", "content": turn["answer"]},
+            ]
+        )
+    messages.append({"role": "user", "content": question})
+
+    try:
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            temperature=0.4,
+        )
+    except Exception as exc:
+        _raise_groq_error(
+            exc,
+            "I couldn't answer that weather question right now.",
+        )
+
+    try:
+        answer = response.choices[0].message.content
+    except (AttributeError, IndexError, TypeError) as exc:
+        raise AIServiceError(
+            "I couldn't answer that weather question right now."
+        ) from exc
+
+    if not isinstance(answer, str) or not answer.strip():
+        raise AIServiceError(
+            "I couldn't answer that weather question right now."
+        )
+    return answer.strip()
+
+
+def _read_conversation(value: Any) -> list[dict[str, str]]:
+    """Validate and bound client-provided follow-up context."""
+
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > MAX_CONVERSATION_TURNS:
+        raise ValueError("Conversation context must contain at most six exchanges.")
+
+    conversation = []
+    for turn in value:
+        if not isinstance(turn, dict):
+            raise ValueError("Conversation context contains an invalid exchange.")
+        prior_question = turn.get("question")
+        prior_answer = turn.get("answer")
+        if (
+            not isinstance(prior_question, str)
+            or not prior_question.strip()
+            or len(prior_question) > MAX_QUESTION_LENGTH
+            or not isinstance(prior_answer, str)
+            or not prior_answer.strip()
+            or len(prior_answer) > MAX_CONVERSATION_ANSWER_LENGTH
+        ):
+            raise ValueError("Conversation context contains an invalid exchange.")
+        conversation.append(
+            {
+                "question": prior_question.strip(),
+                "answer": prior_answer.strip(),
+            }
+        )
+    return conversation
+
+
+def _resolve_default_location(value: Any) -> dict[str, Any] | None:
+    """Resolve the currently selected frontend location for a live question."""
+
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("The selected weather location is invalid.")
+
+    name = value.get("name")
+    if not isinstance(name, str) or not name.strip() or len(name) > MAX_CITY_LENGTH:
+        raise ValueError("The selected weather location is invalid.")
+
+    has_latitude = "latitude" in value
+    has_longitude = "longitude" in value
+    if has_latitude != has_longitude:
+        raise ValueError("The selected weather location has incomplete coordinates.")
+    if has_latitude:
+        location = resolve_coordinates(value["latitude"], value["longitude"])
+        location["name"] = name.strip()
+        region = value.get("region", "")
+        country = value.get("country", "")
+        location["region"] = region if isinstance(region, str) else ""
+        location["country"] = country if isinstance(country, str) else ""
+        return location
+
+    return resolve_location(name.strip())
 
 
 def _display_date(value: str) -> str:
@@ -284,13 +422,11 @@ def _hourly_recommendation(activity: str, hour: dict[str, Any]) -> str:
         return "It depends"
 
     if activity == "umbrella":
-        if severe or rain >= 40 or precipitation > 0.2 or any(
+        if severe or rain >= 30 or precipitation > 0.2 or any(
             term in condition.casefold() for term in ("rain", "drizzle", "snow")
         ):
             return "Yes"
-        if rain <= 20:
-            return "No"
-        return "It depends"
+        return "No"
 
     if activity == "travel":
         if severe or rain >= 70 or wind >= 50:
@@ -393,18 +529,19 @@ def _daily_recommendation(
     rain = day["rain_probability_pct"]
 
     if activity == "umbrella":
-        if "unavailable" in condition.casefold():
-            return (
-                f"It depends: the condition forecast for {location_name} on "
-                f"{date_label} is unavailable, though the rain chance is {rain}%."
-            )
-        if _is_severe_condition(condition) or rain >= 40 or any(
+        if _is_severe_condition(condition) or rain >= 30 or any(
             term in condition.casefold() for term in ("rain", "drizzle", "snow")
         ):
             return f"Yes—take an umbrella in {location_name} on {date_label}: up to {rain}% chance of rain."
-        if rain <= 20:
-            return f"No, you likely won't need an umbrella in {location_name} on {date_label}: {rain}% chance of rain."
-        return f"It depends: {location_name} has up to {rain}% chance of rain on {date_label}; check again before heading out."
+        condition_note = (
+            ""
+            if "unavailable" in condition.casefold()
+            else f" Conditions are {condition.lower()}."
+        )
+        return (
+            f"No, you likely won't need an umbrella in {location_name} on "
+            f"{date_label}: up to {rain}% chance of rain.{condition_note}"
+        )
 
     daytime_hours = [
         hour
@@ -654,12 +791,17 @@ def weather_endpoint() -> tuple[Response, int]:
             400,
         )
 
+    try:
+        conversation = _read_conversation(body.get("conversation"))
+    except ValueError as exc:
+        return _error(str(exc), 400)
+
     # ---------------------------------------------------------
     # STEP 1: Understand the user's question using Qwen
     # ---------------------------------------------------------
 
     try:
-        intent = understand_question(question.strip())
+        intent = understand_question(question.strip(), conversation)
 
     except ValueError as exc:
         return _error(str(exc), 400)
@@ -667,15 +809,41 @@ def weather_endpoint() -> tuple[Response, int]:
     except AIServiceError as exc:
         return _error(str(exc), 503)
 
+    if not intent.get("requires_live_weather", True):
+        try:
+            answer = answer_conceptual_question(question.strip(), conversation)
+        except AIServiceError as exc:
+            return _error(str(exc), 503)
+        return jsonify({"type": "conversation", "answer": answer}), 200
+
     # ---------------------------------------------------------
     # STEP 2: Find the requested location
     # ---------------------------------------------------------
 
+    requested_location = intent["location"]
     try:
-        location = resolve_location(intent["location"])
+        if requested_location:
+            location = resolve_location(requested_location)
+        else:
+            location = _resolve_default_location(body.get("default_location"))
+            if location is None:
+                return _error(
+                    "Tell me a city or town so I can check the live weather.",
+                    400,
+                )
 
+    except InvalidCoordinatesError as exc:
+        return _error(str(exc), 400)
+    except ValueError as exc:
+        return _error(str(exc), 400)
     except LocationNotFoundError as exc:
         return _error(str(exc), 404)
+    except WeatherServiceError:
+        app.logger.exception("Open-Meteo location lookup failed")
+        return _error(
+            "Weather data is temporarily unavailable. Please try again.",
+            502,
+        )
 
     # ---------------------------------------------------------
     # STEP 3: Get real weather data from Open-Meteo
