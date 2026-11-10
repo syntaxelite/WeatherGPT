@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: weathergpt
+    runtime: python
+    plan: free
+    buildCommand: npm ci --prefix frontend && npm run build --prefix frontend && pip install -r backend/requirements.txt
+    startCommand: gunicorn --chdir backend --bind 0.0.0.0:$PORT app:app
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.6
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: qwen/qwen3.8-27b
