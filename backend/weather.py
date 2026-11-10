@@ -310,8 +310,6 @@ def get_forecast(location: dict[str, Any]) -> dict[str, Any]:
                 "condition": _weather_condition(hourly["weather_code"][index]),
             }
         )
-        if len(hourly_forecast) == 24:
-            break
     if len(hourly_forecast) < 24:
         raise WeatherServiceError("The forecast provider returned fewer than 24 upcoming hourly forecasts.")
 
@@ -328,5 +326,6 @@ def get_forecast(location: dict[str, Any]) -> dict[str, Any]:
             "is_day": current.get("is_day") == 1,
         },
         "forecast": forecast,
-        "hourly": hourly_forecast,
+        "hourly": hourly_forecast[:24],
+        "hourly_forecast": hourly_forecast,
     }

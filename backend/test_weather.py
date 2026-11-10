@@ -123,9 +123,11 @@ class OpenMeteoErrorTests(unittest.TestCase):
         self.assertEqual(forecast["timezone"], "Europe/Helsinki")
         self.assertEqual(len(forecast["forecast"]), 7)
         self.assertEqual(len(forecast["hourly"]), 24)
+        self.assertEqual(len(forecast["hourly_forecast"]), 48)
         self.assertEqual(forecast["hourly"][0]["time"], "2026-10-05T12:00")
         self.assertEqual(forecast["hourly"][0]["rain_probability_pct"], 20)
         self.assertEqual(forecast["hourly"][0]["wind_kmh"], 12.0)
+        self.assertEqual(forecast["hourly_forecast"][-1]["time"], "2026-10-07T11:00")
         self.assertEqual(get.call_args.kwargs["params"]["timezone"], "auto")
 
     @patch("weather.requests.get")

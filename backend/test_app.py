@@ -1,7 +1,7 @@
 import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import app
 from weather import LocationNotFoundError, WeatherServiceError
@@ -31,6 +31,25 @@ def weather_fixture():
             for day in range(5, 12)
         ],
         "hourly": [],
+        "hourly_forecast": [],
+    }
+
+
+def hourly_fixture(
+    *,
+    condition="Partly cloudy",
+    temperature=20.0,
+    rain=10,
+    precipitation=0.0,
+    wind=12.0,
+):
+    return {
+        "time": "2026-10-05T15:00",
+        "temperature_c": temperature,
+        "rain_probability_pct": rain,
+        "precipitation_mm": precipitation,
+        "wind_kmh": wind,
+        "condition": condition,
     }
 
 
@@ -115,6 +134,7 @@ class WeatherEndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["location"]["name"], "Helsinki")
         self.assertEqual(response.get_json()["location"]["timezone"], "Europe/Helsinki")
+        self.assertNotIn("hourly_forecast", response.get_json()["weather"])
         resolve.assert_called_once_with("Helsinki")
         forecast.assert_called_once()
 
@@ -173,6 +193,24 @@ class WeatherEndpointTests(unittest.TestCase):
             )
 
     @patch.object(app, "_groq_client")
+    def test_understands_activity_and_local_time(self, groq_client):
+        response = groq_client.return_value.chat.completions.create.return_value
+        response.choices = [Mock(message=Mock(content=(
+            '{"is_weather_question": true, "location": "Munnar", '
+            '"day_offset": 0, "activity": "picnic", "local_time": "15:00"}'
+        )))]
+
+        self.assertEqual(
+            app.understand_question("Can I go for a picnic in Munnar at 3 PM?"),
+            {
+                "location": "Munnar",
+                "day_offset": 0,
+                "activity": "picnic",
+                "local_time": "15:00",
+            },
+        )
+
+    @patch.object(app, "_groq_client")
     def test_answer_uses_only_retrieved_facts(self, groq_client):
         answer = app.generate_answer(
             "Weather in Helsinki today",
@@ -181,12 +219,127 @@ class WeatherEndpointTests(unittest.TestCase):
             0,
         )
 
-        self.assertIn("20.0°C", answer)
-        self.assertIn("10.0°C", answer)
-        self.assertIn("Partly cloudy", answer)
+        self.assertIn("20°C", answer)
+        self.assertIn("10°C", answer)
+        self.assertIn("partly cloudy", answer)
         self.assertIn("20% chance of rain", answer)
-        self.assertIn("55% humidity", answer)
+        self.assertNotIn("humidity", answer)
+        self.assertNotIn("Current conditions", answer)
         groq_client.assert_not_called()
+
+    def test_picnic_answer_uses_the_requested_hour_and_retrieved_weather(self):
+        weather = weather_fixture()
+        weather["hourly_forecast"] = [hourly_fixture()]
+
+        answer = app.generate_answer(
+            "Can I go for a picnic in Munnar at 3 PM?",
+            {"name": "Munnar"},
+            weather,
+            0,
+            "picnic",
+            "15:00",
+        )
+
+        self.assertTrue(answer.startswith("Yes—"))
+        self.assertIn("picnic", answer)
+        self.assertIn("around 3 PM", answer)
+        self.assertIn("10% chance of rain", answer)
+        self.assertIn("12 km/h winds", answer)
+
+    def test_activity_without_a_requested_hour_uses_that_days_best_window(self):
+        weather = weather_fixture()
+        weather["hourly_forecast"] = [
+            {
+                **hourly_fixture(),
+                "time": "2026-10-05T08:00",
+                "rain_probability_pct": 5,
+            },
+            hourly_fixture(),
+        ]
+
+        answer = app.generate_answer(
+            "Can I go for a picnic in Munnar today?",
+            {"name": "Munnar"},
+            weather,
+            0,
+            "picnic",
+        )
+
+        self.assertTrue(answer.startswith("Yes—"))
+        self.assertIn("around 8 AM", answer)
+        self.assertIn("5% chance of rain", answer)
+
+    def test_activity_answer_uses_a_severe_hour_to_recommend_against_it(self):
+        weather = weather_fixture()
+        weather["hourly_forecast"] = [
+            hourly_fixture(
+                condition="Thunderstorm",
+                rain=85,
+                precipitation=4.0,
+                wind=48,
+            )
+        ]
+
+        answer = app.generate_answer(
+            "Can I go for a picnic in Munnar at 3 PM?",
+            {"name": "Munnar"},
+            weather,
+            0,
+            "picnic",
+            "15:00",
+        )
+
+        self.assertTrue(answer.startswith("No—"))
+        self.assertIn("thunderstorm", answer.casefold())
+        self.assertIn("85% chance of rain", answer)
+
+    def test_unavailable_hourly_condition_does_not_make_a_confident_recommendation(self):
+        weather = weather_fixture()
+        weather["hourly_forecast"] = [
+            hourly_fixture(condition="Conditions unavailable")
+        ]
+
+        answer = app.generate_answer(
+            "Can I go for a picnic in Munnar at 3 PM?",
+            {"name": "Munnar"},
+            weather,
+            0,
+            "picnic",
+            "15:00",
+        )
+
+        self.assertTrue(answer.startswith("It depends"))
+
+    def test_specific_time_without_hourly_data_reports_uncertainty(self):
+        answer = app.generate_answer(
+            "Can I go for a picnic in Munnar at 3 PM?",
+            {"name": "Munnar"},
+            weather_fixture(),
+            0,
+            "picnic",
+            "15:00",
+        )
+
+        self.assertTrue(answer.startswith("It depends:"))
+        self.assertIn("don't have an hourly forecast", answer)
+        self.assertIn("3 PM", answer)
+
+    def test_umbrella_answer_is_direct_and_uses_hourly_rain_data(self):
+        weather = weather_fixture()
+        weather["hourly_forecast"] = [hourly_fixture(rain=65, precipitation=0.8)]
+
+        answer = app.generate_answer(
+            "Should I bring an umbrella in Munnar at 3 PM?",
+            {"name": "Munnar"},
+            weather,
+            0,
+            "umbrella",
+            "15:00",
+        )
+
+        self.assertTrue(answer.startswith("Yes—"))
+        self.assertIn("65% chance of rain", answer)
+        self.assertIn("0.8 mm of precipitation", answer)
 
     def test_answer_rejects_day_offset_outside_available_forecast(self):
         for offset in (7, -1, True, 1.5, "1"):
@@ -309,6 +462,8 @@ class WeatherEndpointTests(unittest.TestCase):
         return_value={
             "location": "Arbitrary town",
             "day_offset": 1,
+            "activity": "picnic",
+            "local_time": "15:00",
         },
     )
     def test_returns_real_weather_payload_shape(
@@ -375,6 +530,7 @@ class WeatherEndpointTests(unittest.TestCase):
         )
 
         answer.assert_called_once()
+        self.assertEqual(answer.call_args.args[4:], ("picnic", "15:00"))
         understand.assert_called_once()
         self.assertEqual(payload["location"]["timezone"], "Europe/Helsinki")
 
